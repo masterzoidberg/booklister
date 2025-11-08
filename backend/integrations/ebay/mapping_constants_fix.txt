@@ -1,0 +1,18 @@
+# This file documents the fixes needed for mapping.py
+# Constants to update:
+# EBAY_NONFICTION_CATEGORY_ID -> EBAY_CATEGORY_NONFICTION
+# EBAY_CHILDRENS_BOOKS_CATEGORY_ID -> EBAY_CATEGORY_CHILDRENS_BOOKS
+# CHILDRENS_ONLY_ASPECTS -> CHILDRENS_BOOKS_ONLY_ASPECTS
+# select_category -> determine_category
+
+# Fixes needed:
+# 1. Line 31-32: Update constant names
+# 2. Line 55, 57, 60: Update return values in get_ebay_category_id
+# 3. Line 74, 77: Update in _is_aspect_valid_for_category
+# 4. Line 76: Fix CHILDRENS_ONLY_ASPECTS -> CHILDRENS_BOOKS_ONLY_ASPECTS
+# 5. Line 135, 154, 158: Update in determine_category (select_category)
+# 6. Line 235, 321, 565: Update select_category calls
+# 7. Line 568-569: Update category checks
+# 8. Line 702, 714, 720: Fix valid_aspects references (use is_nonfiction flag)
+# 9. Line 835-855: Fix filtered_aspects (create it from cleaned_aspects first)
+

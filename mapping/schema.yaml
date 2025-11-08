@@ -1,0 +1,51 @@
+# BookLister AI CSV Schema Configuration
+
+## CSV Header Order (Fixed)
+The CSV export follows this exact column order:
+
+1. **SKU** - Book ID (default)
+2. **Title** - AI-generated or manual title
+3. **Description** - AI-generated or manual description
+4. **CategoryID** - eBay category ID (placeholder for now)
+5. **ConditionID** - Mapped condition grade
+6. **Price** - Suggested price
+7. **Quantity** - Quantity available
+8. **PictureURL** - Semicolon-separated image URLs
+9. **Location** - Default "Home"
+10. **Currency** - Default "USD"
+11. **ISBN** - ISBN-13 if available
+12. **Author** - Book author
+13. **BookTitle** - Original book title
+14. **Publisher** - Publisher name
+15. **PublicationYear** - Publication year
+16. **Format** - Book format (Hardcover, Paperback, etc.)
+17. **Language** - Book language
+18. **Edition** - Edition information
+19. **Signed** - "Yes" or "No"
+20. **Inscribed** - "Yes" or "No"
+21. **Features** - Semicolon-separated features
+22. **Topic** - Main topic/subject
+23. **Genre** - Book genre
+24. **PaymentPolicyName** - Payment policy
+25. **ShippingPolicyName** - Shipping policy
+26. **ReturnPolicyName** - Return policy
+
+## Condition ID Mapping
+- Brand New = 1000
+- Like New = 2750
+- Very Good = 4000
+- Good = 5000
+- Acceptable = 6000
+
+## Policy Resolution Order
+1. Book-specific override (if set)
+2. Global default (from settings)
+3. Block export if missing
+
+## Multi-value Fields
+Use semicolon separation:
+- Features: "Feature1;Feature2;Feature3"
+- PictureURL: "url1;url2;url3"
+
+## File Naming
+Export files use timestamp format: `books_export_YYYYMMDD_HHMMSS.csv`
