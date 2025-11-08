@@ -1,6 +1,61 @@
 # Implementation Status - eBay API Publishing
 
-## Latest Update: Git Repository Setup and Security Hardening
+## Latest Update: Research Prompt Created for Deep Investigation
+
+**Date**: 2025-11-08
+**Phase**: Research & Investigation
+
+### Summary
+
+Created comprehensive research prompt (`RESEARCH_PROMPT.md`) for deep research AI to investigate issues with the image-to-eBay-listing flow. The prompt includes complete flow documentation, key files to analyze, investigation areas, and expected deliverables.
+
+### Changes Made
+
+**Research Prompt** (`RESEARCH_PROMPT.md`):
+1. **Complete Flow Documentation**:
+   - Step-by-step flow from image upload to eBay listing
+   - All key files and their roles
+   - Data flow between components
+
+2. **Known Issues Documentation**:
+   - Error 25002 (currency) - partially fixed
+   - Vision extraction issues
+   - Mapping issues
+   - Publishing flow issues
+
+3. **Investigation Areas**:
+   - Vision extraction quality
+   - Book model → eBay mapping
+   - Publishing flow validation
+   - Error handling & logging
+
+4. **Key Files Identified**:
+   - 19 critical files with specific purposes
+   - Line number references for known fixes
+   - Test files to review
+
+5. **Specific Issues to Investigate**:
+   - Vision extraction failures
+   - Mapping validation failures
+   - Publishing flow failures
+   - Data flow issues
+
+6. **Expected Deliverables**:
+   - Root cause analysis
+   - Specific fixes with code
+   - Validation improvements
+   - Testing recommendations
+   - Documentation updates
+
+### Next Steps
+
+- Deep research AI will use this prompt to investigate issues
+- Expected to identify root causes and provide fixes
+- Will update status with findings
+
+---
+
+## Previous Update: Git Repository Setup and Security Hardening
 
 **Date**: 2025-11-08
 **Phase**: Repository Setup - Security
