@@ -379,7 +379,7 @@ class VisionExtractionService(BaseSettings):
                     "extracted": extracted_dict
                 }
             except Exception as e:
-                logger.error(f"Failed to validate response against EnrichResult model: {e}\nResponse: {content[:500]}")
+                logger.error("Vision extraction validation failed: %s\nResponse: %s", e, (response_text or "")[:500])
                 return {
                     "ok": False,
                     "errors": [f"Response validation error: {str(e)}"],

@@ -17,6 +17,7 @@ export default function SettingsPage() {
   
   // eBay OAuth state
   const [oauthStatus, setOAuthStatus] = useState<any>(null);
+  const [oauthHealth, setOAuthHealth] = useState<any>(null);
   const [oauthLoading, setOAuthLoading] = useState(false);
   const [authCode, setAuthCode] = useState('');
   const [exchangingCode, setExchangingCode] = useState(false);
@@ -52,6 +53,15 @@ export default function SettingsPage() {
     try {
       const status = await ebayOAuthApi.getStatus();
       setOAuthStatus(status);
+
+      // Also load health info with probe
+      try {
+        const health = await ebayOAuthApi.getHealth();
+        setOAuthHealth(health);
+      } catch (healthError: any) {
+        console.error('Failed to load OAuth health:', healthError);
+        setOAuthHealth(null);
+      }
     } catch (error: any) {
       console.error('Failed to load OAuth status:', error);
       if (error.message && error.message.includes('Backend server is not running')) {
@@ -436,11 +446,31 @@ export default function SettingsPage() {
             {/* Connection Status */}
             <div className="flex items-center justify-between p-4 bg-muted/50 rounded-lg">
               <div className="flex items-center gap-3">
-                {oauthStatus?.connected ? (
+                {oauthHealth?.has_access && oauthHealth?.last_valid_probe?.status === 200 ? (
                   <>
                     <CheckCircle className="h-5 w-5 text-green-600" />
                     <div>
-                      <div className="font-medium">Connected</div>
+                      <div className="font-medium">Connected & Verified</div>
+                      {oauthHealth.access_expires_in_s !== null && (
+                        <div className="text-sm text-muted-foreground">
+                          Access token expires in {formatExpirationTime(oauthHealth.access_expires_in_s)}
+                        </div>
+                      )}
+                      {oauthHealth.has_refresh && (
+                        <div className="text-xs text-muted-foreground">
+                          Refresh token available
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : oauthStatus?.connected ? (
+                  <>
+                    <XCircle className="h-5 w-5 text-yellow-600" />
+                    <div>
+                      <div className="font-medium">Connected (Unverified)</div>
+                      {oauthHealth?.last_valid_probe?.error && (
+                        <div className="text-sm text-muted-foreground">{oauthHealth.last_valid_probe.error}</div>
+                      )}
                       {oauthStatus.expires_in && (
                         <div className="text-sm text-muted-foreground">
                           Expires in {formatExpirationTime(oauthStatus.expires_in)}
@@ -460,11 +490,15 @@ export default function SettingsPage() {
                   </>
                 )}
               </div>
-              {oauthStatus?.connected && (
+              {oauthHealth?.has_access && oauthHealth?.last_valid_probe?.status === 200 ? (
                 <Badge variant="outline" className="bg-green-50 text-green-700 border-green-200">
-                  Active
+                  Active & Verified
                 </Badge>
-              )}
+              ) : oauthStatus?.connected ? (
+                <Badge variant="outline" className="bg-yellow-50 text-yellow-700 border-yellow-200">
+                  Needs Verification
+                </Badge>
+              ) : null}
             </div>
 
             {/* Connection Actions */}

@@ -76,7 +76,14 @@ async def extract_book_vision(
         
         # Map extracted fields to Book model
         mapped_fields = vision_service.map_to_book_fields(result.get("extracted", {}))
-        
+
+        # Validate critical fields - title must be present
+        if not (mapped_fields.get("title_ai") or mapped_fields.get("title")):
+            raise HTTPException(
+                status_code=422,
+                detail="Vision AI did not extract a title. Please ensure the book images clearly show the title page."
+            )
+
         # Update book with extracted data
         for field, value in mapped_fields.items():
             if field == "condition_grade":

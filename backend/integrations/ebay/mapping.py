@@ -283,14 +283,33 @@ def build_inventory_item(
         }
     }
 
+    # Build packageWeightAndSize (required for shipping)
+    weight_lbs = getattr(book, "weight_lbs", None)
+    if not weight_lbs or weight_lbs <= 0:
+        weight_lbs = 1.0  # Default: 1 lb for books
+
+    package_weight_and_size: Dict[str, Any] = {
+        "weight": {
+            "value": f"{weight_lbs:.2f}",
+            "unit": "POUND"
+        },
+        "dimensions": {
+            "length": str(getattr(book, "dim_length", 9)),
+            "width": str(getattr(book, "dim_width", 6)),
+            "height": str(getattr(book, "dim_height", 2)),
+            "unit": "INCH"
+        }
+    }
+
     # Build inventory item payload
     inventory_item: Dict[str, Any] = {
         "sku": book.id,
         "product": product,
-        "availability": availability
+        "availability": availability,
+        "packageWeightAndSize": package_weight_and_size
     }
 
-    logger.info(f"[Inventory] Built inventory item for book {book.id}: quantity={book.quantity}")
+    logger.info(f"[Inventory] Built inventory item for book {book.id}: quantity={book.quantity}, weight={weight_lbs:.2f} lbs")
 
     return inventory_item, title_length, title_truncated
 
@@ -654,10 +673,19 @@ def _build_aspects(book: Book, category_id: Optional[str] = None) -> Dict[str, A
         if format_array:
             aspects["Format"] = format_array if len(format_array) > 1 else format_array[0]
     
-    # Topic - available in both categories
-    topic_value = _normalize_aspect_value(specifics.get("topic"))
+    # Topic - available in both categories (split comma-joined strings into arrays)
+    topic_value = specifics.get("topic")
     if topic_value:
-        aspects["Topic"] = topic_value
+        if isinstance(topic_value, str) and "," in topic_value:
+            # Split comma-separated string into array
+            topic_list = [t.strip() for t in topic_value.split(",") if t.strip()]
+            aspects["Topic"] = topic_list
+        elif isinstance(topic_value, list):
+            aspects["Topic"] = [str(t).strip() for t in topic_value if t and str(t).strip()]
+        else:
+            normalized = _normalize_aspect_value(topic_value)
+            if normalized:
+                aspects["Topic"] = [normalized]
     
     # Genre - ONLY available in Children's Books (29792)
     if is_childrens_books:
@@ -781,14 +809,11 @@ def _build_aspects(book: Book, category_id: Optional[str] = None) -> Dict[str, A
         if features_array:
             aspects["Features"] = features_array
     
-    # NEEDS VERIFICATION: Signed
-    # May need to be "Signed By" instead of "Signed" - verify via Taxonomy API
-    # Keeping "Signed By" aspect (already enabled above) and adding note about "Signed"
-    # Temporarily disabled to avoid Error 25001 until verified
-    # if specifics.get("signed") is not None:
-    #     aspects["Signed"] = "Yes" if specifics.get("signed") else "No"
-    # else:
-    #     aspects["Signed"] = "No"
+    # Signed - re-enabled after verification
+    if specifics.get("signed") is not None:
+        aspects["Signed"] = "Yes" if specifics.get("signed") else "No"
+    else:
+        aspects["Signed"] = "No"
     
     # NEEDS CASE/SPELLING VERIFICATION: Ex Libris
     # May need to be "Ex-Libris" or "Ex-Library" - test with API

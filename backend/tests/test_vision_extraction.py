@@ -156,12 +156,102 @@ class TestVisionExtraction:
     def test_vision_service_initialization(self):
         """Test VisionExtractionService can be initialized."""
         from services.vision_extraction import VisionExtractionService
-        
+
         # Without API key (should still initialize)
         service = VisionExtractionService(openai_api_key=None)
         assert service.client is None
-        
+
         # With API key
         service = VisionExtractionService(openai_api_key="test-key")
         assert service.client is not None
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o"})
+    async def test_vision_extraction_missing_title_validation(self, client, db_session, sample_book, sample_images, tmp_path, monkeypatch):
+        """Test vision extraction returns 422 when AI does not extract a title."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        # Mock OpenAI client to return response without title
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"author": "Test Author", "isbn13": "9781234567890", "publisher": "Test Publisher", "publicationYear": "2020"}'
+
+        with patch('services.vision_extraction.OpenAI') as mock_openai:
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = MagicMock(return_value=mock_response)
+            mock_openai.return_value = mock_client
+
+            from services.vision_extraction import VisionExtractionService
+            service = VisionExtractionService()
+            service.base_dir = str(tmp_path / "data" / "images")
+
+            # Add image to database
+            db_session.add(sample_images["image"])
+            db_session.commit()
+
+            # Mock the route's vision service
+            with patch('routes.ai_vision.VisionExtractionService') as MockVisionService:
+                mock_service_instance = MagicMock()
+                mock_service_instance.extract_from_images_vision = AsyncMock(
+                    return_value={
+                        "ok": True,
+                        "errors": [],
+                        "extracted": {
+                            "ebay_title": "",  # Empty title
+                            "core": {
+                                "book_title": "",  # Empty title
+                                "author": "Test Author"
+                            },
+                            "ai_description": {},
+                            "pricing": {}
+                        }
+                    }
+                )
+                mock_service_instance.map_to_book_fields = MagicMock(
+                    return_value={
+                        # No title_ai or title field
+                        "author": "Test Author"
+                    }
+                )
+                MockVisionService.return_value = mock_service_instance
+
+                response = client.post(f"/ai/vision/{sample_book.id}")
+
+                # Should return 422 for missing title
+                assert response.status_code == 422
+                data = response.json()
+                assert "title" in data["detail"].lower()
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "OPENAI_MODEL": "gpt-4o"})
+    async def test_vision_extraction_validation_error_logging(self, client, db_session, sample_book, sample_images, tmp_path, monkeypatch):
+        """Test vision extraction handles validation errors without NameError."""
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+        # Mock OpenAI client to return invalid response that fails validation
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        # Invalid JSON that will fail parsing or validation
+        mock_response.choices[0].message.content = '{"invalid": "structure"}'
+
+        with patch('services.vision_extraction.OpenAI') as mock_openai:
+            mock_client = MagicMock()
+            mock_client.chat.completions.create = MagicMock(return_value=mock_response)
+            mock_openai.return_value = mock_client
+
+            from services.vision_extraction import VisionExtractionService
+            service = VisionExtractionService(openai_api_key="test-key")
+            service.base_dir = str(tmp_path / "data" / "images")
+
+            # Add image to database
+            db_session.add(sample_images["image"])
+            db_session.commit()
+
+            # Call vision extraction - should handle validation error without NameError
+            result = await service.extract_from_images_vision(sample_book.id)
+
+            # Should return error result, not raise NameError
+            assert result["ok"] is False
+            assert "errors" in result
+            assert len(result["errors"]) > 0
 

@@ -109,8 +109,7 @@ class EBayClient:
             "Authorization": f"Bearer {token}",
             "Content-Language": "en-US",
             "Accept": "application/json",
-            "X-EBAY-SOA-REQUEST-DATA-FORMAT": "JSON",
-            "X-EBAY-SOA-RESPONSE-DATA-FORMAT": "JSON"
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"
         }
 
         # Add Content-Type only when sending data
@@ -322,8 +321,25 @@ class EBayClient:
                             listing_id = warning.get("listingId")
 
             return True, response_json, listing_id, None
+        elif status_code == 409:
+            # 409 Conflict - offer already published (idempotent success)
+            logger.info(f"[Publish] Offer {offer_id} already published (409 Conflict), treating as success")
+            listing_id = None
+            if response_json:
+                listing_id = response_json.get("listingId")
+                # Try to extract from error message if not in direct field
+                if not listing_id and "errors" in response_json:
+                    errors = response_json.get("errors", [])
+                    for err in errors:
+                        msg = err.get("message", "")
+                        if "listing" in msg.lower() or "listingId" in err:
+                            listing_id = err.get("listingId")
+            return True, response_json, listing_id, None
         else:
             logger.error(f"[Publish] Offer {offer_id} publish failed, status={status_code}, error={error}")
+            # Log full error JSON for debugging
+            if response_json:
+                logger.error(f"[Publish] Full eBay error response: {response_json}")
             return False, response_json, None, error
     
     def get_offer(self, offer_id: str) -> Tuple[bool, Optional[Dict[str, Any]], Optional[str]]:

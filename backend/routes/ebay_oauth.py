@@ -209,6 +209,92 @@ async def get_oauth_status(session: Session = Depends(get_session)):
         )
 
 
+@router.get("/health")
+async def get_token_health(session: Session = Depends(get_session)):
+    """
+    Get detailed token health information with live Sell API probe.
+
+    Returns access/refresh token TTLs and validates token with actual API call.
+    Access tokens are redacted for security.
+    """
+    try:
+        encryption = get_encryption()
+        token_store = TokenStore(session, encryption)
+
+        token = token_store.get_token("ebay")
+
+        if not token:
+            return {
+                "has_access": False,
+                "has_refresh": False,
+                "access_expires_in_s": None,
+                "refresh_expires_in_s": None,
+                "last_valid_probe": {
+                    "status": None,
+                    "error": "No token found"
+                },
+                "is_expired": True
+            }
+
+        # Calculate seconds until expiration for ACCESS token (not refresh)
+        import datetime as dt
+        now = int(dt.datetime.now().timestamp() * 1000)
+        access_expires_in_s = max(0, (token.expires_at - now) // 1000)
+        is_expired = token_store.is_expired(token, buffer_seconds=60)
+
+        # Refresh tokens typically last 18 months (47304000 seconds)
+        # We don't store refresh token expiry separately, so estimate
+        # or mark as unknown
+        refresh_expires_in_s = None  # Unknown unless explicitly tracked
+
+        # Probe Sell Account API to verify token actually works
+        probe_result = {
+            "status": None,
+            "error": None
+        }
+
+        try:
+            from integrations.ebay.client import EBayClient
+            client = EBayClient(session)
+
+            # Try to get payment policies as a lightweight health check
+            success, data, error = client.get_payment_policies(marketplace_id="EBAY_US")
+
+            if success:
+                probe_result["status"] = 200
+            else:
+                probe_result["status"] = 401  # Assume 401 if failed
+                probe_result["error"] = str(error)[:200] if error else "Unknown error"
+        except Exception as e:
+            probe_result["status"] = None
+            probe_result["error"] = f"Probe failed: {str(e)[:200]}"
+
+        return {
+            "has_access": True,
+            "has_refresh": bool(token.refresh_token and token.refresh_token != token.access_token),
+            "access_expires_in_s": access_expires_in_s,
+            "refresh_expires_in_s": refresh_expires_in_s,
+            "last_valid_probe": probe_result,
+            "is_expired": is_expired,
+            "token_type": token.token_type,
+            "scope": token.scope,
+            "access_token_preview": token.access_token[:20] + "..." if token.access_token and len(token.access_token) > 20 else "***"
+        }
+    except Exception as e:
+        logger.error(f"Failed to get token health: {e}", exc_info=True)
+        return {
+            "has_access": False,
+            "has_refresh": False,
+            "access_expires_in_s": None,
+            "refresh_expires_in_s": None,
+            "last_valid_probe": {
+                "status": None,
+                "error": str(e)[:200]
+            },
+            "is_expired": True
+        }
+
+
 @router.post("/refresh")
 async def refresh_token_endpoint(session: Session = Depends(get_session)):
     """

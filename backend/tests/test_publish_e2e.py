@@ -198,19 +198,23 @@ class TestPublishEndpoints:
         """Test publish flow when inventory item creation fails."""
         mock_resolve_urls.return_value = ["https://example.com/images/image1.jpg"]
         mock_create_inv.return_value = (False, {}, "Inventory creation failed")
-        
+
         monkeypatch.setenv("EBAY_ENV", "sandbox")
         monkeypatch.setenv("EBAY_PAYMENT_POLICY_ID", "test-payment-policy")
         monkeypatch.setenv("EBAY_RETURN_POLICY_ID", "test-return-policy")
         monkeypatch.setenv("EBAY_FULFILLMENT_POLICY_ID", "test-fulfillment-policy")
-        
+
         response = client.post(f"/ebay/publish/{sample_book_with_images.id}")
-        
+
         assert response.status_code == 400
         data = response.json()
         assert data["success"] is False
         assert "error" in data
         assert "Inventory item creation failed" in data["error"]
+
+        # Verify book publish_status was set to "failed"
+        db_session.refresh(sample_book_with_images)
+        assert sample_book_with_images.publish_status == "failed"
     
     @patch('integrations.ebay.client.EBayClient.create_or_replace_inventory_item')
     @patch('integrations.ebay.client.EBayClient.create_offer')
@@ -230,19 +234,88 @@ class TestPublishEndpoints:
         mock_resolve_urls.return_value = ["https://example.com/images/image1.jpg"]
         mock_create_inv.return_value = (True, {}, None)
         mock_create_offer.return_value = (False, {}, None, "Offer creation failed")
-        
+
         monkeypatch.setenv("EBAY_ENV", "sandbox")
         monkeypatch.setenv("EBAY_PAYMENT_POLICY_ID", "test-payment-policy")
         monkeypatch.setenv("EBAY_RETURN_POLICY_ID", "test-return-policy")
         monkeypatch.setenv("EBAY_FULFILLMENT_POLICY_ID", "test-fulfillment-policy")
-        
+
         response = client.post(f"/ebay/publish/{sample_book_with_images.id}")
-        
+
         assert response.status_code == 400
         data = response.json()
         assert data["success"] is False
         assert "Offer creation failed" in data["error"]
+
+        # Verify book publish_status was set to "failed"
+        db_session.refresh(sample_book_with_images)
+        assert sample_book_with_images.publish_status == "failed"
     
+    @patch('integrations.ebay.client.EBayClient.create_or_replace_inventory_item')
+    @patch('integrations.ebay.client.EBayClient.create_offer')
+    @patch('integrations.ebay.client.EBayClient.publish_offer')
+    @patch('integrations.ebay.images.resolve_listing_urls')
+    def test_publish_book_publish_offer_failure(
+        self,
+        mock_resolve_urls,
+        mock_publish_offer,
+        mock_create_offer,
+        mock_create_inv,
+        client,
+        db_session,
+        sample_book_with_images,
+        oauth_token,
+        monkeypatch
+    ):
+        """Test publish flow when publish offer step fails."""
+        mock_resolve_urls.return_value = ["https://example.com/images/image1.jpg"]
+        mock_create_inv.return_value = (True, {}, None)
+        mock_create_offer.return_value = (True, {"offerId": "test-offer-123"}, "test-offer-123", None)
+        mock_publish_offer.return_value = (False, {}, None, "Publish offer failed")
+
+        monkeypatch.setenv("EBAY_ENV", "sandbox")
+        monkeypatch.setenv("EBAY_PAYMENT_POLICY_ID", "test-payment-policy")
+        monkeypatch.setenv("EBAY_RETURN_POLICY_ID", "test-return-policy")
+        monkeypatch.setenv("EBAY_FULFILLMENT_POLICY_ID", "test-fulfillment-policy")
+
+        response = client.post(f"/ebay/publish/{sample_book_with_images.id}")
+
+        assert response.status_code == 400
+        data = response.json()
+        assert data["success"] is False
+        assert "Publish failed" in data["error"]
+
+        # Verify book publish_status was set to "failed"
+        db_session.refresh(sample_book_with_images)
+        assert sample_book_with_images.publish_status == "failed"
+
+    @patch('integrations.ebay.images.resolve_listing_urls')
+    def test_publish_book_non_https_image_urls(
+        self,
+        mock_resolve_urls,
+        client,
+        db_session,
+        sample_book_with_images,
+        oauth_token,
+        monkeypatch
+    ):
+        """Test publish flow rejects non-HTTPS image URLs."""
+        # Mock to return HTTP URL (not HTTPS)
+        mock_resolve_urls.return_value = ["http://example.com/images/image1.jpg"]
+
+        monkeypatch.setenv("EBAY_ENV", "sandbox")
+        monkeypatch.setenv("EBAY_PAYMENT_POLICY_ID", "test-payment-policy")
+        monkeypatch.setenv("EBAY_RETURN_POLICY_ID", "test-return-policy")
+        monkeypatch.setenv("EBAY_FULFILLMENT_POLICY_ID", "test-fulfillment-policy")
+
+        response = client.post(f"/ebay/publish/{sample_book_with_images.id}")
+
+        # Should fail with 400 for non-HTTPS URL
+        assert response.status_code == 400
+        data = response.json()
+        assert "detail" in data
+        assert "HTTPS" in data["detail"]
+
     def test_publish_status_endpoint(self, client, db_session, sample_book_with_images):
         """Test GET /ebay/publish/{book_id}/status endpoint."""
         # Set publish status

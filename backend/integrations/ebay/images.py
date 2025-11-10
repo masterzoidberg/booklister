@@ -131,11 +131,25 @@ async def _resolve_media_urls(
     except (MediaAPIError, EbayMediaUploadError) as e:
         request_id = getattr(e, 'request_id', None)
         status_code = getattr(e, 'status_code', None)
+        error_msg = str(e)
+
+        # Provide specific hints based on error type
+        if status_code == 401 or status_code == 403:
+            hint = "Authentication failed. Please check your OAuth token."
+        elif status_code == 400:
+            hint = "Invalid image format or dimensions. Images must be JPEG/PNG and at least 500px on the long edge."
+        elif status_code and status_code >= 500:
+            hint = "eBay API is experiencing issues. Please try again later."
+        elif "network" in error_msg.lower() or "timeout" in error_msg.lower():
+            hint = "Network error. Please check your connection and try again."
+        else:
+            hint = "Please check image format (JPEG/PNG) and dimensions (min 500px)."
+
         logger.error(
             f"Media API upload failed for book {book_id}: {e}",
             extra={"request_id": request_id, "status_code": status_code}
         )
-        raise ValueError(f"Image upload failed: {e}")
+        raise ValueError(f"Image upload to eBay failed: {error_msg}. {hint}")
     
     # Validate EPS URLs
     _validate_eps_urls(eps_urls)
@@ -175,14 +189,14 @@ def _resolve_self_host_urls(
         url = f"{base_url}/images/{book_id}/{filename}"
         urls.append(url)
     
-    # Validate URLs are HTTPS (in production)
-    if ebay_settings.ebay_env == "production":
-        for url in urls:
-            if not url.startswith('https://'):
-                raise ValueError(
-                    f"Production requires HTTPS URLs: {url}. "
-                    "Use Strategy B (media) or set up HTTPS hosting."
-                )
+    # Validate URLs are HTTPS (required by eBay in all environments)
+    for url in urls:
+        if not url.startswith('https://'):
+            raise ValueError(
+                f"eBay requires HTTPS image URLs: {url}. "
+                "Use image_strategy='media' to upload images to eBay Picture Services, "
+                "or configure HTTPS hosting for self-hosted images."
+            )
     
     return urls
 

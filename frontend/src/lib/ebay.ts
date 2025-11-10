@@ -9,6 +9,21 @@ export interface OAuthStatus {
   error?: string;
 }
 
+export interface OAuthHealth {
+  has_access: boolean;
+  has_refresh: boolean;
+  access_expires_in_s: number | null;
+  refresh_expires_in_s: number | null;
+  last_valid_probe: {
+    status: number | null;
+    error?: string;
+  };
+  is_expired: boolean;
+  token_type?: string;
+  scope?: string;
+  access_token_preview?: string;
+}
+
 export interface AuthUrlResponse {
   auth_url: string;
   redirect_uri: string;
@@ -188,6 +203,13 @@ export const ebayOAuthApi = {
    */
   getStatus: async (): Promise<OAuthStatus> => {
     return api.get<OAuthStatus>('/ebay/oauth/status');
+  },
+
+  /**
+   * Get detailed token health with live API probe
+   */
+  getHealth: async (): Promise<OAuthHealth> => {
+    return api.get<OAuthHealth>('/ebay/oauth/health');
   },
 
   /**

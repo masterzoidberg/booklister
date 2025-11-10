@@ -4,7 +4,7 @@ eBay publish flow with image upload integration
 import json
 import logging
 from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
+import datetime as dt
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from sqlmodel import Session
 from fastapi import HTTPException
@@ -409,7 +409,20 @@ async def create_or_replace_inventory_item(
     
     inventory_item = prep_result["inventory_item"]
     sku = inventory_item.get("sku", book_id)
-    
+
+    # Validate packageWeightAndSize is present
+    if "packageWeightAndSize" not in inventory_item:
+        raise HTTPException(
+            status_code=422,
+            detail="Inventory item missing required packageWeightAndSize"
+        )
+    weight_data = inventory_item["packageWeightAndSize"].get("weight")
+    if not weight_data or not weight_data.get("value") or weight_data.get("unit") != "POUND":
+        raise HTTPException(
+            status_code=422,
+            detail="Inventory item packageWeightAndSize.weight must have value and unit=POUND"
+        )
+
     # Log aspect names before API call for debugging Error 25001
     if "product" in inventory_item and "aspects" in inventory_item["product"]:
         aspects = inventory_item["product"]["aspects"]
@@ -1110,6 +1123,12 @@ async def publish_book(
     )
     
     if not inv_result["success"]:
+        # Update book publish_status to failed
+        book.publish_status = "failed"
+        book.updated_at = int(dt.datetime.now().timestamp() * 1000)
+        session.add(book)
+        session.commit()
+
         return {
             "success": False,
             "sku": None,
@@ -1137,6 +1156,13 @@ async def publish_book(
     except HTTPException as e:
         # Convert HTTPException to failure result dict for consistency
         logger.error(f"Offer creation failed for book {book_id}: {e.detail}")
+
+        # Update book publish_status to failed
+        book.publish_status = "failed"
+        book.updated_at = int(dt.datetime.now().timestamp() * 1000)
+        session.add(book)
+        session.commit()
+
         return {
             "success": False,
             "sku": sku,
@@ -1156,6 +1182,12 @@ async def publish_book(
         }
     
     if not offer_result["success"]:
+        # Update book publish_status to failed
+        book.publish_status = "failed"
+        book.updated_at = int(dt.datetime.now().timestamp() * 1000)
+        session.add(book)
+        session.commit()
+
         return {
             "success": False,
             "sku": sku,
@@ -1179,7 +1211,7 @@ async def publish_book(
             book.ebay_offer_id = offer_id
             book.ebay_category_id = category_id
             book.publish_status = "draft"
-            book.updated_at = int(datetime.now().timestamp() * 1000)
+            book.updated_at = int(dt.datetime.now().timestamp() * 1000)
             session.add(book)
             session.commit()
 
@@ -1205,6 +1237,14 @@ async def publish_book(
     )
 
     if not publish_result["success"]:
+        # Update book publish_status to failed
+        book = session.get(Book, book_id)
+        if book:
+            book.publish_status = "failed"
+            book.updated_at = int(dt.datetime.now().timestamp() * 1000)
+            session.add(book)
+            session.commit()
+
         return {
             "success": False,
             "sku": sku,
@@ -1232,13 +1272,12 @@ async def publish_book(
     # Update book with publish results
     book = session.get(Book, book_id)
     if book:
-        from datetime import datetime
         book.sku = sku
         book.ebay_category_id = category_id
         book.ebay_offer_id = offer_id
         book.ebay_listing_id = listing_id
         book.publish_status = "published"
-        book.updated_at = int(datetime.now().timestamp() * 1000)
+        book.updated_at = int(dt.datetime.now().timestamp() * 1000)
         session.add(book)
         session.commit()
         session.refresh(book)

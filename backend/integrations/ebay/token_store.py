@@ -108,13 +108,19 @@ class TokenStore:
                 return None
             
             # Try to decrypt access token
+            plaintext_access = None
+            plaintext_refresh = None
+            needs_migration = False
+
             try:
                 token.access_token = self.encryption.decrypt(token.access_token)
             except Exception as e:
                 # Check if token is already plaintext (stored before encryption was added)
                 if not token.access_token.startswith('gAAAAAB'):
-                    # Token appears to be plaintext, use as-is
-                    logger.warning(f"Token for {provider} appears to be unencrypted (doesn't start with gAAAAAB), using as-is")
+                    # Token appears to be plaintext - migrate it
+                    logger.info(f"Detected unencrypted access token for {provider}, will migrate to encrypted storage")
+                    plaintext_access = token.access_token
+                    needs_migration = True
                 else:
                     # Real decryption error - log full details
                     logger.error(
@@ -123,15 +129,17 @@ class TokenStore:
                         exc_info=True
                     )
                     return None
-            
+
             # Try to decrypt refresh token
             try:
                 token.refresh_token = self.encryption.decrypt(token.refresh_token)
             except Exception as e:
                 # Check if token is already plaintext
                 if not token.refresh_token.startswith('gAAAAAB'):
-                    # Token appears to be plaintext, use as-is
-                    logger.warning(f"Refresh token for {provider} appears to be unencrypted (doesn't start with gAAAAAB), using as-is")
+                    # Token appears to be plaintext - migrate it
+                    logger.info(f"Detected unencrypted refresh token for {provider}, will migrate to encrypted storage")
+                    plaintext_refresh = token.refresh_token
+                    needs_migration = True
                 else:
                     # Real decryption error - log full details
                     logger.error(
@@ -140,6 +148,26 @@ class TokenStore:
                         exc_info=True
                     )
                     return None
+
+            # Migrate plaintext tokens to encrypted storage
+            if needs_migration:
+                logger.info(f"Migrating plaintext tokens for {provider} to encrypted storage")
+                # Re-fetch token from DB to update
+                db_token = self.session.get(Token, provider)
+                if db_token:
+                    if plaintext_access:
+                        db_token.access_token = self.encryption.encrypt(plaintext_access)
+                        token.access_token = plaintext_access  # Use decrypted value
+                    if plaintext_refresh:
+                        db_token.refresh_token = self.encryption.encrypt(plaintext_refresh)
+                        token.refresh_token = plaintext_refresh  # Use decrypted value
+
+                    db_token.updated_at = int(datetime.now().timestamp() * 1000)
+                    self.session.add(db_token)
+                    self.session.commit()
+                    logger.info(f"Successfully migrated tokens for {provider} to encrypted storage")
+                else:
+                    logger.error(f"Could not re-fetch token for {provider} to migrate")
         except Exception as e:
             logger.error(
                 f"Unexpected error decrypting token for {provider}: {type(e).__name__}: {str(e)}",
