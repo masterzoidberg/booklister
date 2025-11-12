@@ -3,6 +3,8 @@ eBay publish flow with image upload integration
 """
 import json
 import logging
+import time
+from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import datetime as dt
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -14,9 +16,13 @@ from settings import ebay_settings
 from integrations.ebay.mapping import build_inventory_item, build_offer
 from integrations.ebay.images import resolve_listing_urls
 from integrations.ebay.client import EBayClient
+from integrations.ebay.utils.money import to_money_str, equal_money
 from services.policy_settings import get_policy_settings
 
 logger = logging.getLogger(__name__)
+
+# Offer trace directory (for payload logging)
+OFFER_TRACE_DIR = Path("backend/logs/offer_payloads")
 
 # [Context7] Using /fastapi/fastapi (HTTPException 422 for preflight validation)
 # [Context7] Using /websites/pydantic_dev (Decimal.quantize for 2-decimal formatting)
@@ -32,19 +38,11 @@ MARKETPLACE_CURRENCY = {
 }
 
 
-def normalize_price(value: Any) -> str:
+def normalize_price_str(value: Any) -> str:
     """
     Normalize price to string with exactly 2 decimal places.
 
-    Converts any numeric input (int, float, Decimal, str) to a Decimal,
-    quantizes to 2 decimal places with ROUND_HALF_UP, and returns as string.
-
-    Examples:
-        normalize_price(35) -> "35.00"
-        normalize_price(35.0) -> "35.00"
-        normalize_price(35.99) -> "35.99"
-        normalize_price("35") -> "35.00"
-        normalize_price(Decimal("35.999")) -> "36.00" (rounds up)
+    Wrapper around to_money_str for consistency with spec requirements.
 
     Args:
         value: Numeric value (int, float, Decimal, or numeric string)
@@ -55,26 +53,218 @@ def normalize_price(value: Any) -> str:
     Raises:
         ValueError: If value cannot be converted to Decimal
     """
+    return to_money_str(value)
+
+
+# DEPRECATED: Use to_money_str from integrations.ebay.utils.money instead
+# Kept for backward compatibility, but delegates to to_money_str
+def normalize_price(value: Any) -> str:
+    """
+    Normalize price to string with exactly 2 decimal places.
+
+    DEPRECATED: Use to_money_str() from integrations.ebay.utils.money instead.
+    This function is kept for backward compatibility and delegates to to_money_str.
+
+    Args:
+        value: Numeric value (int, float, Decimal, or numeric string)
+
+    Returns:
+        String with exactly 2 decimal places (e.g., "35.00")
+
+    Raises:
+        ValueError: If value cannot be converted to Decimal
+    """
+    return to_money_str(value)
+
+
+def create_offer_and_verify(
+    client: EBayClient,
+    payload: Dict[str, Any],
+    max_retries: int = 5,
+    backoff_sec: float = 0.6
+) -> str:
+    """
+    Create offer with read-after-write verification and retries.
+
+    This function:
+    1. Normalizes price to two-decimal string
+    2. Saves request payload to trace file
+    3. POSTs offer creation
+    4. Retries GET until offer exists and is in valid status
+    5. Returns verified offerId
+
+    Args:
+        client: EBayClient instance
+        payload: Offer payload dict
+        max_retries: Maximum GET retries for verification (default: 5)
+        backoff_sec: Initial backoff in seconds (default: 0.6)
+
+    Returns:
+        Verified offerId string
+
+    Raises:
+        RuntimeError: If create fails or verification fails after retries
+    """
+    # Extract SKU for logging
+    sku = payload.get("sku", "unknown")
+
+    # Ensure price normalization (two-decimal string)
+    pricing_summary = payload.get("pricingSummary", {})
+    price_obj = pricing_summary.get("price", {})
+    price_value = price_obj.get("value")
+    if price_value:
+        try:
+            normalized_price = normalize_price_str(price_value)
+            payload["pricingSummary"]["price"]["value"] = normalized_price
+            logger.info(f"[OfferCreate] Normalized price for SKU={sku}: {price_value} → {normalized_price}")
+        except ValueError as e:
+            raise RuntimeError(f"Invalid price value for SKU={sku}: {price_value} ({e})")
+
+    # Trace request payload
+    OFFER_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    trace_file = OFFER_TRACE_DIR / f"{timestamp}-{sku}-create.json"
     try:
-        # Convert to Decimal
-        if isinstance(value, Decimal):
-            decimal_value = value
+        with open(trace_file, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        logger.info(f"[OfferCreate] Traced payload to {trace_file}")
+    except Exception as e:
+        logger.warning(f"[OfferCreate] Failed to save trace: {e}")
+
+    # POST offer creation
+    success, response_data, offer_id, error = client.create_offer(offer=payload)
+
+    if not success or not offer_id:
+        error_msg = f"Create failed for SKU={sku}: {error}"
+        logger.error(f"[OfferCreate] {error_msg}")
+        # Save error response to trace
+        try:
+            error_trace_file = OFFER_TRACE_DIR / f"{timestamp}-{sku}-create-error.json"
+            with open(error_trace_file, "w", encoding="utf-8") as f:
+                json.dump({"error": error, "response": response_data}, f, indent=2)
+            logger.error(f"[OfferCreate] Error trace saved to {error_trace_file}")
+        except Exception as e:
+            logger.warning(f"[OfferCreate] Failed to save error trace: {e}")
+        raise RuntimeError(error_msg)
+
+    logger.info(f"[OfferCreate] status=201 offerId={offer_id} for SKU={sku}")
+
+    # Retry GET until offer exists and is in valid status
+    valid_statuses = {"UNPUBLISHED", "PUBLISHED", "PUBLISHED_OUT_OF_STOCK"}
+    for attempt in range(1, max_retries + 1):
+        wait_time = backoff_sec * attempt
+        time.sleep(wait_time)
+
+        logger.info(f"[OfferVerify] Attempt {attempt}/{max_retries} - GET offer {offer_id}")
+        get_success, offer_data, get_error = client.get_offer(offer_id)
+
+        if get_success and offer_data:
+            offer_status = offer_data.get("status")
+            if offer_status in valid_statuses:
+                logger.info(f"[OfferVerify] confirmed offerId={offer_id} status={offer_status} for SKU={sku}")
+                return offer_id
+            else:
+                logger.warning(
+                    f"[OfferVerify] Offer {offer_id} has unexpected status: {offer_status}, retrying..."
+                )
         else:
-            decimal_value = Decimal(str(value))
+            logger.warning(
+                f"[OfferVerify] GET failed for offer {offer_id} (attempt {attempt}): {get_error}"
+            )
 
-        # Quantize to 2 decimal places with ROUND_HALF_UP
-        quantized = decimal_value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    # All retries exhausted
+    error_msg = f"Offer verification failed for offerId={offer_id} after {max_retries} retries"
+    logger.error(f"[OfferVerify] {error_msg}")
+    raise RuntimeError(error_msg)
 
-        # Return as string
-        return str(quantized)
-    except (ValueError, InvalidOperation) as e:
-        raise ValueError(f"Cannot normalize price '{value}': {str(e)}")
+
+def verify_offer_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Verify and log critical fields in offer payload before sending to eBay.
+
+    Args:
+        payload: Offer payload to verify
+
+    Returns:
+        Dict with verification report (for logging)
+
+    Raises:
+        HTTPException if critical fields are missing
+    """
+    report = {
+        "sku": payload.get("sku"),
+        "marketplaceId": payload.get("marketplaceId"),
+        "format": payload.get("format"),
+        "categoryId": payload.get("categoryId"),
+        "price_value": None,
+        "price_currency": None,
+        "paymentPolicyId": None,
+        "returnPolicyId": None,
+        "fulfillmentPolicyId": None,
+        "merchantLocationKey": payload.get("merchantLocationKey"),
+        "quantity": payload.get("availableQuantity") or payload.get("quantity")
+    }
+
+    # Extract price from nested structure
+    pricing = payload.get("pricingSummary") or payload.get("pricing")
+    if pricing:
+        price_obj = pricing.get("price")
+        if price_obj:
+            report["price_value"] = price_obj.get("value")
+            report["price_currency"] = price_obj.get("currency")
+
+    # Extract policy IDs from various possible locations
+    # Payment policy
+    if "pricingSummary" in payload and "paymentPolicyId" in payload["pricingSummary"]:
+        report["paymentPolicyId"] = payload["pricingSummary"]["paymentPolicyId"]
+    elif "paymentPolicyId" in payload:
+        report["paymentPolicyId"] = payload["paymentPolicyId"]
+
+    # Return policy
+    if "returnPolicyId" in payload:
+        report["returnPolicyId"] = payload["returnPolicyId"]
+
+    # Fulfillment policy
+    if "fulfillmentPolicyId" in payload:
+        report["fulfillmentPolicyId"] = payload["fulfillmentPolicyId"]
+
+    # Check critical fields
+    missing = []
+    if not report["sku"]:
+        missing.append("sku")
+    if not report["marketplaceId"]:
+        missing.append("marketplaceId")
+    if not report["categoryId"]:
+        missing.append("categoryId")
+    if not report["price_value"]:
+        missing.append("price.value")
+    if not report["price_currency"]:
+        missing.append("price.currency")
+    if not report["paymentPolicyId"]:
+        missing.append("paymentPolicyId")
+    if not report["returnPolicyId"]:
+        missing.append("returnPolicyId")
+    if not report["fulfillmentPolicyId"]:
+        missing.append("fulfillmentPolicyId")
+
+    if missing:
+        logger.error(f"[Offer Verification] FAILED - Missing fields: {missing}")
+        logger.error(f"[Offer Verification] Report: {json.dumps(report, indent=2)}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Offer payload missing required fields: {', '.join(missing)}"
+        )
+
+    # Log success
+    logger.info(f"[Offer Verification] PASSED - {json.dumps(report, separators=(',', ':'))}")
+
+    return report
 
 
 def extract_currency_from_offer(offer_json: Dict[str, Any]) -> Optional[str]:
     """
     Extract currency from offer JSON, checking both pricing and pricingSummary fields.
-    
+
     eBay GET /offer/{id} may return pricing in either:
     - offer.pricing.price.currency (request-like format)
     - offer.pricingSummary.price.currency (response-like format)
@@ -151,7 +341,7 @@ def validate_currency(offer_payload: Dict[str, Any], marketplace_id: str) -> Non
 
     Validates that:
     1. Expected currency is defined for marketplace
-    2. Offer pricing structure is present
+    2. Offer pricingSummary structure is present (never pricing)
     3. Price value is present, numeric, and > 0
     4. Price is formatted with 2 decimal places (e.g., "35.00")
     5. Currency matches marketplace expected currency
@@ -159,7 +349,7 @@ def validate_currency(offer_payload: Dict[str, Any], marketplace_id: str) -> Non
     Raises HTTPException 422 on validation failure (fail-fast).
 
     Args:
-        offer_payload: eBay offer payload (must contain pricing.price.value and pricing.price.currency)
+        offer_payload: eBay offer payload (must contain pricingSummary.price.value and pricingSummary.price.currency)
         marketplace_id: eBay marketplace ID (e.g., "EBAY_US")
 
     Raises:
@@ -172,23 +362,30 @@ def validate_currency(offer_payload: Dict[str, Any], marketplace_id: str) -> Non
         logger.error(f"[Currency Validation] {error_msg}")
         raise HTTPException(status_code=422, detail=error_msg)
 
-    # Check pricing structure
-    pricing = offer_payload.get("pricing")
-    if not pricing:
-        error_msg = "Offer payload missing 'pricing' field"
+    # Check pricingSummary structure (never pricing)
+    pricing_summary = offer_payload.get("pricingSummary")
+    if not pricing_summary:
+        error_msg = "Offer payload missing 'pricingSummary' field (required by eBay Sell Inventory API)"
         logger.error(f"[Currency Validation] {error_msg}")
         raise HTTPException(status_code=422, detail=error_msg)
 
-    price_obj = pricing.get("price")
+    # DEBUG: Reject if pricing field exists (should never happen)
+    if "pricing" in offer_payload:
+        logger.warning(
+            f"[Currency Validation] WARNING: Offer payload contains deprecated 'pricing' field. "
+            f"Only 'pricingSummary' should be used."
+        )
+
+    price_obj = pricing_summary.get("price")
     if not price_obj:
-        error_msg = "Offer payload missing 'pricing.price' field"
+        error_msg = "Offer payload missing 'pricingSummary.price' field"
         logger.error(f"[Currency Validation] {error_msg}")
         raise HTTPException(status_code=422, detail=error_msg)
 
     # Validate price value
     price_value = price_obj.get("value")
     if price_value is None:
-        error_msg = "Offer payload missing 'pricing.price.value'"
+        error_msg = "Offer payload missing 'pricingSummary.price.value'"
         logger.error(f"[Currency Validation] {error_msg}")
         raise HTTPException(status_code=422, detail=error_msg)
 
@@ -225,7 +422,7 @@ def validate_currency(offer_payload: Dict[str, Any], marketplace_id: str) -> Non
     # Validate currency
     currency = price_obj.get("currency")
     if not currency:
-        error_msg = "Offer payload missing 'pricing.price.currency'"
+        error_msg = "Offer payload missing 'pricingSummary.price.currency'"
         logger.error(f"[Currency Validation] {error_msg}")
         raise HTTPException(status_code=422, detail=error_msg)
 
@@ -239,8 +436,8 @@ def validate_currency(offer_payload: Dict[str, Any], marketplace_id: str) -> Non
 
     # Validation passed
     logger.info(
-        f"[Currency Validation] PASS: marketplace={marketplace_id}, "
-        f"currency={currency}, price={price_value}"
+        f"[Currency Validation] marketplace={marketplace_id} currency={currency} "
+        f"price={to_money_str(price_value)}"
     )
 
 
@@ -327,19 +524,19 @@ async def prepare_for_publish(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Inventory item build failed: {str(e)}")
     
-    # Get policy IDs from saved defaults if not provided
+    # Get policy IDs from saved defaults if not provided (auto-fetch and persist if missing)
     if not payment_policy_id or not return_policy_id or not fulfillment_policy_id:
         policy_service = get_policy_settings(session)
-        resolved_ids = policy_service.get_resolved_ids(ebay_settings.ebay_marketplace_id)
+        defaults = policy_service.ensure_defaults(ebay_settings.ebay_marketplace_id)
 
         if not payment_policy_id:
-            payment_policy_id = resolved_ids.get("payment_policy_id")
+            payment_policy_id = defaults.payment_policy_id
         if not return_policy_id:
-            return_policy_id = resolved_ids.get("return_policy_id")
+            return_policy_id = defaults.return_policy_id
         if not fulfillment_policy_id:
-            fulfillment_policy_id = resolved_ids.get("fulfillment_policy_id")
+            fulfillment_policy_id = defaults.fulfillment_policy_id
 
-        # Fallback to environment settings if still None
+        # Fallback to environment settings if still None (no policies on account)
         if not payment_policy_id:
             payment_policy_id = ebay_settings.ebay_payment_policy_id if hasattr(ebay_settings, 'ebay_payment_policy_id') else None
         if not return_policy_id:
@@ -497,20 +694,36 @@ async def create_or_update_offer(
         logger.error(error_msg)
         raise HTTPException(status_code=400, detail=error_msg)
 
-    # Get policy IDs from saved defaults if not provided
+    # Pre-publish weight guard: Require shipping weight before creating offer
+    weight_lb = book.shipping_weight_lb or 0.0
+    weight_oz = book.shipping_weight_oz or 0.0
+    total_weight_lb = weight_lb + (weight_oz / 16.0)
+    
+    if total_weight_lb <= 0:
+        error_msg = "missing_shipping_weight"
+        logger.error(f"[Pre-Publish Guard] Book {book_id}: {error_msg}")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": error_msg,
+                "message": "Please enter book weight (lb/oz) before publishing."
+            }
+        )
+
+    # Get policy IDs from saved defaults if not provided (auto-fetch and persist if missing)
     marketplace_id = ebay_settings.ebay_marketplace_id
     if not payment_policy_id or not return_policy_id or not fulfillment_policy_id:
         policy_service = get_policy_settings(session)
-        resolved_ids = policy_service.get_resolved_ids(marketplace_id)
+        defaults = policy_service.ensure_defaults(marketplace_id)
 
         if not payment_policy_id:
-            payment_policy_id = resolved_ids.get("payment_policy_id")
+            payment_policy_id = defaults.payment_policy_id
         if not return_policy_id:
-            return_policy_id = resolved_ids.get("return_policy_id")
+            return_policy_id = defaults.return_policy_id
         if not fulfillment_policy_id:
-            fulfillment_policy_id = resolved_ids.get("fulfillment_policy_id")
+            fulfillment_policy_id = defaults.fulfillment_policy_id
 
-        # Fallback to environment settings if still None
+        # Fallback to environment settings if still None (no policies on account)
         if not payment_policy_id:
             payment_policy_id = ebay_settings.ebay_payment_policy_id if hasattr(ebay_settings, 'ebay_payment_policy_id') else None
         if not return_policy_id:
@@ -557,6 +770,13 @@ async def create_or_update_offer(
         logger.error(error_msg)
         raise HTTPException(status_code=400, detail=error_msg)
 
+    # Verify offer payload completeness
+    try:
+        verify_offer_payload(offer)
+    except HTTPException:
+        # Re-raise verification errors
+        raise
+
     # Preflight validation: validate currency BEFORE any API calls
     try:
         validate_currency(offer, marketplace_id)
@@ -586,7 +806,7 @@ async def create_or_update_offer(
 
         # Self-heal: Ensure existing offer has correct currency
         expected_currency = MARKETPLACE_CURRENCY.get(marketplace_id)
-        expected_price = offer.get("pricing", {}).get("price", {}).get("value")
+        expected_price = offer.get("pricingSummary", {}).get("price", {}).get("value")
 
         if expected_currency:
             logger.info(f"[Self-Heal] Checking offer {existing_offer_id} for currency={expected_currency}")
@@ -607,10 +827,41 @@ async def create_or_update_offer(
     # Decide: create or update
     if existing_offer_id:
         # Update existing offer
+        logger.info(f"[Guard] Modifying offer {existing_offer_id}; ensure pricingSummary preserved")
         logger.info(f"[Offer] Updating existing offer {existing_offer_id} for SKU={sku}")
         success, response_data, error = client.update_offer(existing_offer_id, offer)
 
         if success:
+            # Verify update succeeded with read-after-write check
+            logger.info(f"[OfferUpdate] 204 → reGET to verify")
+            verify_success, verify_data, verify_error = client.get_offer(existing_offer_id)
+
+            if verify_success and verify_data:
+                # Check that price and policies match expectations
+                verify_price = verify_data.get("pricingSummary", {}).get("price", {}).get("value")
+                expected_price = offer.get("pricingSummary", {}).get("price", {}).get("value")
+                verify_lp = verify_data.get("listingPolicies") or {}
+
+                if verify_price != expected_price:
+                    logger.warning(
+                        f"[OfferUpdate] Price mismatch after update: "
+                        f"expected={expected_price} got={verify_price}, retrying update"
+                    )
+                    # Retry update once
+                    success2, response2, error2 = client.update_offer(existing_offer_id, offer)
+                    if success2:
+                        logger.info(f"[OfferUpdate] Retry succeeded for offer {existing_offer_id}")
+                    else:
+                        logger.error(f"[OfferUpdate] Retry failed for offer {existing_offer_id}: {error2}")
+
+                # Log verified state
+                logger.info(
+                    f"[OfferUpdate] Verified offer {existing_offer_id}: "
+                    f"price={verify_price} policies={sorted(verify_lp.keys())}"
+                )
+            else:
+                logger.warning(f"[OfferUpdate] Verification GET failed: {verify_error}")
+
             logger.info(
                 f"[Offer] Using offerId={existing_offer_id} for SKU={sku} (marketplace={marketplace_id}); "
                 f"action=update; publish=pending"
@@ -633,8 +884,48 @@ async def create_or_update_offer(
             }
     else:
         # Create new offer
+        # Extract key values for logging
+        price_value = offer.get("pricingSummary", {}).get("price", {}).get("value")
+        currency = offer.get("pricingSummary", {}).get("price", {}).get("currency")
+        
+        # Log preflight: payload keys and key values
+        payload_keys = sorted(offer.keys())
+        logger.info(
+            f"[Offer Build] sku={sku} mkt={marketplace_id} price_value={price_value} currency={currency}"
+        )
+        logger.info(f"[Offer Build] Payload keys: {payload_keys}")
+        
+        # Dump full payload to trace file
+        import os
+        from pathlib import Path
+        from datetime import datetime
+        
+        trace_dir = Path("backend/logs/offer_payloads")
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        trace_file = trace_dir / f"{timestamp}-{sku}-create.json"
+        
+        try:
+            with open(trace_file, "w", encoding="utf-8") as f:
+                json.dump(offer, f, indent=2, ensure_ascii=False)
+            logger.info(f"[Offer Build] Full payload traced to: {trace_file}")
+        except Exception as e:
+            logger.warning(f"[Offer Build] Failed to save trace: {e}")
+        
         logger.info(f"[Offer] Creating new offer for SKU={sku}")
-        success, response_data, offer_id, error = client.create_offer(offer=offer)
+
+        # Use create_offer_and_verify for read-after-write verification
+        try:
+            offer_id = create_offer_and_verify(client, offer)
+            success = True
+            response_data = {"offerId": offer_id}  # Simplified response for consistency
+            error = None
+        except RuntimeError as e:
+            success = False
+            offer_id = None
+            error = str(e)
+            response_data = None
+            logger.error(f"[Offer] create_offer_and_verify failed: {error}")
 
         if success:
             logger.info(
@@ -705,6 +996,101 @@ async def create_or_update_offer(
 create_offer = create_or_update_offer
 
 
+def self_heal_offer_policies(
+    client: EBayClient,
+    offer_id: str,
+    offer_data: Dict[str, Any],
+    payment_policy_id: str,
+    fulfillment_policy_id: str,
+    return_policy_id: str
+) -> Tuple[bool, Optional[str]]:
+    """
+    Self-heal offer if policies are missing from listingPolicies.
+
+    Checks if offer has all three policy IDs under listingPolicies.
+    If any are missing, patches the offer with corrected listingPolicies and re-verifies.
+
+    Args:
+        client: EBayClient instance
+        offer_id: Offer ID to heal
+        offer_data: Current offer data from GET
+        payment_policy_id: Expected payment policy ID
+        fulfillment_policy_id: Expected fulfillment policy ID
+        return_policy_id: Expected return policy ID
+
+    Returns:
+        Tuple of (success, error_message)
+        - success: True if policies are present or successfully healed
+        - error_message: Error description if healing failed
+    """
+    # Check listingPolicies presence
+    lp = offer_data.get("listingPolicies") or {}
+    missing = []
+    if not lp.get("paymentPolicyId"):
+        missing.append("paymentPolicyId")
+    if not lp.get("fulfillmentPolicyId"):
+        missing.append("fulfillmentPolicyId")
+    if not lp.get("returnPolicyId"):
+        missing.append("returnPolicyId")
+
+    if not missing:
+        # All policies present
+        logger.info(f"[Policy Self-Heal] Offer {offer_id} has all policies in listingPolicies")
+        return True, None
+
+    # Log missing policies
+    logger.warning(
+        f"[Policy Self-Heal] offerId={offer_id} missing={missing} → patching listingPolicies"
+    )
+
+    # Build patch payload with corrected listingPolicies
+    from integrations.ebay.offer_builder import build_listing_policies
+    patch_payload = build_listing_policies(
+        payment_id=payment_policy_id,
+        fulfillment_id=fulfillment_policy_id,
+        return_id=return_policy_id
+    )
+
+    # Send PUT to update offer
+    update_success, update_response, update_error = client.update_offer(offer_id, patch_payload)
+
+    if not update_success:
+        error_msg = f"Self-heal PUT failed for offer {offer_id}: {update_error}"
+        logger.error(f"[Policy Self-Heal] {error_msg}")
+        return False, error_msg
+
+    logger.info(f"[Policy Self-Heal] PUT succeeded for offer {offer_id}")
+
+    # Re-GET to verify healing
+    get_success, healed_offer_data, get_error = client.get_offer(offer_id)
+    if not get_success:
+        error_msg = f"Self-heal re-GET failed for offer {offer_id}: {get_error}"
+        logger.error(f"[Policy Self-Heal] {error_msg}")
+        return False, error_msg
+
+    # Check if policies are now present
+    healed_lp = healed_offer_data.get("listingPolicies") or {}
+    still_missing = []
+    if not healed_lp.get("paymentPolicyId"):
+        still_missing.append("paymentPolicyId")
+    if not healed_lp.get("fulfillmentPolicyId"):
+        still_missing.append("fulfillmentPolicyId")
+    if not healed_lp.get("returnPolicyId"):
+        still_missing.append("returnPolicyId")
+
+    if still_missing:
+        error_msg = f"Self-heal failed: offer {offer_id} still missing {still_missing} after PUT"
+        logger.error(f"[Policy Self-Heal] {error_msg}")
+        logger.error(f"[Policy Self-Heal] Healed offer listingPolicies: {healed_lp}")
+        return False, error_msg
+
+    logger.info(
+        f"[Policy Self-Heal] Offer {offer_id} successfully healed, "
+        f"listingPolicies keys: {sorted(healed_lp.keys())}"
+    )
+    return True, None
+
+
 def prepublish_assertions(
     offer_json: Dict[str, Any],
     expected_marketplace_id: str,
@@ -719,11 +1105,14 @@ def prepublish_assertions(
     - categoryId present
     - pricing.price.currency OR pricingSummary.price.currency matches expected
     - pricing.price.value OR pricingSummary.price.value present and normalized
-    - paymentPolicyId, fulfillmentPolicyId, returnPolicyId present
+    - listingPolicies.paymentPolicyId, fulfillmentPolicyId, returnPolicyId present
 
     Note: Quantity is NOT validated here. eBay manages quantity at the inventory item level
     (availability.shipToLocationAvailability.quantity), not in the offer. The offer links to
     the inventory item via SKU.
+
+    DRAFT offers: Accepts offers with status DRAFT/UNPUBLISHED even if pricingSummary is missing,
+    as long as pricing.price.currency/value are present.
 
     Args:
         offer_json: Offer JSON from GET /offer/{id}
@@ -740,6 +1129,11 @@ def prepublish_assertions(
     logger.info(f"[Pre-Publish Validation] Offer JSON keys: {sorted(offer_json.keys())}")
     logger.debug(f"[Pre-Publish Validation] Full offer JSON: {json.dumps(offer_json, indent=2)}")
 
+    # Check offer status (DRAFT, UNPUBLISHED, PUBLISHED, PUBLISHING are all valid)
+    offer_status = offer_json.get("status")
+    is_draft = offer_status in ["DRAFT", "UNPUBLISHED"]
+    logger.info(f"[Pre-Publish Validation] Offer status: {offer_status} (is_draft={is_draft})")
+
     # Check marketplaceId
     marketplace_id = offer_json.get("marketplaceId")
     if not marketplace_id:
@@ -755,48 +1149,120 @@ def prepublish_assertions(
     if not category_id:
         return False, "Offer missing required field: categoryId"
     
-    # Check currency (using extractor that checks both pricing and pricingSummary)
-    currency = extract_currency_from_offer(offer_json)
+    # Check currency - prioritize pricingSummary (required by eBay Sell Inventory API)
+    currency = None
+    pricing_summary = offer_json.get("pricingSummary")
+    if pricing_summary and pricing_summary.get("price") and pricing_summary["price"].get("currency"):
+        currency = pricing_summary["price"]["currency"]
+    else:
+        # Fallback: check pricing field (for backward compatibility with old offers)
+        pricing = offer_json.get("pricing")
+        if pricing and pricing.get("price") and pricing["price"].get("currency"):
+            currency = pricing["price"]["currency"]
+            logger.warning(
+                f"[Pre-Publish Validation] Offer using deprecated 'pricing' field. "
+                f"Should use 'pricingSummary' instead."
+            )
+    
     if not currency:
-        return False, "Offer missing currency in both pricing.price.currency and pricingSummary.price.currency"
+        # Save trace file for debugging
+        import os
+        from pathlib import Path
+        from datetime import datetime
+        
+        trace_dir = Path("backend/logs/offer_payloads")
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        offer_id = offer_json.get("offerId", "unknown")
+        trace_file = trace_dir / f"{timestamp}-{offer_id}-get.json"
+        
+        try:
+            with open(trace_file, "w", encoding="utf-8") as f:
+                json.dump(offer_json, f, indent=2, ensure_ascii=False)
+            logger.error(f"[Validate] Missing currency in pricingSummary; see trace: {trace_file}")
+        except Exception as e:
+            logger.error(f"[Validate] Missing currency in pricingSummary; failed to save trace: {e}")
+        
+        return False, "Offer missing currency in pricingSummary.price.currency"
     if currency != expected_currency:
         return False, f"Offer currency mismatch: expected {expected_currency}, got {currency}"
+
+    # Check price value - prioritize pricingSummary (required by eBay Sell Inventory API)
+    price_value = None
+    pricing_summary = offer_json.get("pricingSummary")
+    if pricing_summary and pricing_summary.get("price") and pricing_summary["price"].get("value") is not None:
+        price_value = str(pricing_summary["price"]["value"])
+    else:
+        # Fallback: check pricing field (for backward compatibility with old offers)
+        pricing = offer_json.get("pricing")
+        if pricing and pricing.get("price") and pricing["price"].get("value") is not None:
+            price_value = str(pricing["price"]["value"])
+            logger.warning(
+                f"[Pre-Publish Validation] Offer using deprecated 'pricing' field. "
+                f"Should use 'pricingSummary' instead."
+            )
     
-    # Check price value (using extractor that checks both pricing and pricingSummary)
-    price_value = extract_price_value_from_offer(offer_json)
     if not price_value:
-        return False, "Offer missing price value in both pricing.price.value and pricingSummary.price.value"
+        return False, "Offer missing price value in pricingSummary.price.value"
     
-    # Normalize and validate price format
+    # Normalize and validate price format using numeric comparison
+    # eBay may return prices as numeric (75.0) or string ("75.00")
+    # Use equal_money for cents-precision comparison
     try:
-        normalized_price = normalize_price(price_value)
-        if normalized_price != price_value:
+        normalized_price = to_money_str(price_value)
+
+        # Log price validation details
+        logger.info(
+            f"[Pre-Publish Validation] offerId={offer_json.get('offerId')} "
+            f"api_value={price_value} (type={type(price_value).__name__}) "
+            f"normalized={normalized_price} "
+            f"equal={equal_money(price_value, normalized_price)}"
+        )
+
+        # Relaxed check: Allow numeric values like 75.0 to pass even if not "75.00" string
+        if not equal_money(price_value, normalized_price):
             return False, f"Offer price value not normalized: got {price_value}, expected {normalized_price}"
     except ValueError as e:
         return False, f"Offer price value invalid: {str(e)}"
-    
-    # If expected_price provided, validate match
+
+    # If expected_price provided, validate match using numeric comparison
     if expected_price:
         try:
-            normalized_expected = normalize_price(expected_price)
-            if normalized_price != normalized_expected:
+            normalized_expected = to_money_str(expected_price)
+
+            logger.info(
+                f"[Pre-Publish Validation] Price comparison: "
+                f"api_value={price_value} expected={expected_price} "
+                f"normalized_api={normalized_price} normalized_expected={normalized_expected} "
+                f"equal={equal_money(normalized_price, normalized_expected)}"
+            )
+
+            # Use equal_money for cents-precision comparison
+            if not equal_money(normalized_price, normalized_expected):
                 return False, f"Offer price mismatch: expected {normalized_expected}, got {normalized_price}"
         except ValueError as e:
             return False, f"Invalid expected_price: {str(e)}"
     
-    # Check policy IDs
-    payment_policy_id = offer_json.get("paymentPolicyId")
+    # Check policy IDs (must be under listingPolicies)
+    listing_policies = offer_json.get("listingPolicies") or {}
+
+    payment_policy_id = listing_policies.get("paymentPolicyId")
     if not payment_policy_id:
-        return False, "Offer missing required field: paymentPolicyId"
-    
-    fulfillment_policy_id = offer_json.get("fulfillmentPolicyId")
+        return False, "Offer missing required field: listingPolicies.paymentPolicyId"
+
+    fulfillment_policy_id = listing_policies.get("fulfillmentPolicyId")
     if not fulfillment_policy_id:
-        return False, "Offer missing required field: fulfillmentPolicyId"
-    
-    return_policy_id = offer_json.get("returnPolicyId")
+        return False, "Offer missing required field: listingPolicies.fulfillmentPolicyId"
+
+    return_policy_id = listing_policies.get("returnPolicyId")
     if not return_policy_id:
-        return False, "Offer missing required field: returnPolicyId"
-    
+        return False, "Offer missing required field: listingPolicies.returnPolicyId"
+
+    # Log policy IDs for debugging
+    logger.info(
+        f"[Offer Inspect] listingPolicies keys: {sorted(listing_policies.keys())}"
+    )
+
     # All assertions passed
     return True, None
 
@@ -858,83 +1324,147 @@ async def ensure_offer_is_publishable(
     if is_valid:
         logger.info(f"[Pre-Publish] Offer {offer_id} passed all pre-publish assertions")
         return True, offer_id, None
-    
-    # Step 3: Check if error is currency/price related (corrupted offer)
+
+    # Step 2a: Check if validation error is policy-related
+    is_policy_error = (
+        validation_error and
+        "listingPolicies" in validation_error
+    )
+
+    if is_policy_error:
+        # Attempt policy self-heal
+        logger.warning(f"[Pre-Publish] Offer {offer_id} has policy error: {validation_error}")
+
+        # Get policy IDs from settings
+        from services.policy_settings import get_policy_settings
+        policy_service = get_policy_settings(session)
+        defaults = policy_service.ensure_defaults(expected_marketplace_id)
+
+        if defaults.payment_policy_id and defaults.return_policy_id and defaults.fulfillment_policy_id:
+            heal_success, heal_error = self_heal_offer_policies(
+                client=client,
+                offer_id=offer_id,
+                offer_data=offer_data,
+                payment_policy_id=defaults.payment_policy_id,
+                fulfillment_policy_id=defaults.fulfillment_policy_id,
+                return_policy_id=defaults.return_policy_id
+            )
+
+            if heal_success:
+                # Re-GET and re-validate
+                logger.info(f"[Pre-Publish] Policy self-heal succeeded, re-validating offer {offer_id}")
+                get_success2, offer_data2, get_error2 = client.get_offer(offer_id)
+
+                if get_success2:
+                    is_valid2, validation_error2 = prepublish_assertions(
+                        offer_json=offer_data2,
+                        expected_marketplace_id=expected_marketplace_id,
+                        expected_currency=expected_currency,
+                        expected_price=expected_price
+                    )
+
+                    if is_valid2:
+                        logger.info(f"[Pre-Publish] Offer {offer_id} passed validation after policy self-heal")
+                        return True, offer_id, None
+                    else:
+                        logger.warning(
+                            f"[Pre-Publish] Offer {offer_id} still invalid after policy self-heal: {validation_error2}"
+                        )
+                        # Continue to price auto-correct if applicable
+                else:
+                    logger.error(f"[Pre-Publish] Re-GET failed after policy self-heal: {get_error2}")
+            else:
+                logger.error(f"[Pre-Publish] Policy self-heal failed: {heal_error}")
+        else:
+            logger.error(f"[Pre-Publish] Cannot self-heal policies - missing policy defaults")
+
+    # Step 3: Auto-correct price mismatch if validation failed due to price issue
     currency = extract_currency_from_offer(offer_data)
     price_value = extract_price_value_from_offer(offer_data)
-    
-    is_corrupted = (
-        not currency or 
-        not price_value or 
-        currency != expected_currency or
-        "currency" in validation_error.lower() or
-        "price" in validation_error.lower()
+
+    # Check if validation error is price-related and auto-correctable
+    is_price_error = (
+        validation_error and
+        ("price" in validation_error.lower() or "mismatch" in validation_error.lower())
     )
-    
-    if not is_corrupted:
-        # Non-corruption error (e.g., missing policy ID) - don't attempt recreate
-        return False, None, f"Pre-publish validation failed: {validation_error}"
-    
-    # Step 4: Delete corrupted offer
-    logger.warning(
-        f"[Pre-Publish] Offer {offer_id} is corrupted (currency={currency}, price={price_value}). "
-        f"Deleting and recreating..."
-    )
-    
-    delete_success, delete_error = client.delete_offer(offer_id)
-    if not delete_success:
-        return False, None, f"Failed to delete corrupted offer {offer_id}: {delete_error}"
-    
-    logger.info(f"[Pre-Publish] Deleted corrupted offer {offer_id}")
-    
-    # Step 5: Recreate offer
-    if not offer_payload:
-        # Rebuild offer from book
-        book = session.get(Book, book_id)
-        if not book:
-            return False, None, f"Book {book_id} not found for recreate"
-        
-        from integrations.ebay.mapping import build_offer
-        from services.policy_settings import get_policy_settings
-        
-        policy_service = get_policy_settings(session)
-        resolved_ids = policy_service.get_resolved_ids(expected_marketplace_id)
-        
+
+    if is_price_error and expected_price and price_value:
+        # Attempt auto-correct: Update offer with normalized price
         try:
-            offer_payload = build_offer(
-                book=book,
-                payment_policy_id=resolved_ids.get("payment_policy_id"),
-                return_policy_id=resolved_ids.get("return_policy_id"),
-                fulfillment_policy_id=resolved_ids.get("fulfillment_policy_id")
-            )
+            normalized_expected = to_money_str(expected_price)
+
+            # Check if prices are actually different (use equal_money for cents precision)
+            if not equal_money(price_value, normalized_expected):
+                logger.warning(
+                    f"[Pre-Publish Auto-Correct] Offer {offer_id} has price mismatch: "
+                    f"api_value={price_value} expected={normalized_expected}. "
+                    f"Attempting auto-correction via PUT offer update."
+                )
+
+                # Build minimal update payload with corrected price
+                patch_payload = {
+                    "pricingSummary": {
+                        "price": {
+                            "value": normalized_expected,
+                            "currency": currency or expected_currency
+                        }
+                    }
+                }
+
+                # Update offer with corrected price
+                logger.info(f"[Pre-Publish Auto-Correct] Sending PUT update to offer {offer_id}")
+                update_success, update_response, update_error = client.update_offer(offer_id, patch_payload)
+
+                if not update_success:
+                    logger.error(
+                        f"[Pre-Publish Auto-Correct] Failed to update offer {offer_id}: {update_error}"
+                    )
+                    return False, None, f"Pre-publish validation failed and auto-correct failed: {update_error}"
+
+                # Re-fetch the offer to verify the update
+                logger.info(f"[Pre-Publish Auto-Correct] Re-fetching offer {offer_id} to verify correction")
+                get_success2, offer_data2, get_error2 = client.get_offer(offer_id)
+
+                if not get_success2:
+                    return False, None, f"Auto-correct succeeded but re-fetch failed: {get_error2}"
+
+                # Re-validate after correction
+                is_valid2, validation_error2 = prepublish_assertions(
+                    offer_json=offer_data2,
+                    expected_marketplace_id=expected_marketplace_id,
+                    expected_currency=expected_currency,
+                    expected_price=expected_price
+                )
+
+                if is_valid2:
+                    logger.info(
+                        f"[Pre-Publish Auto-Correct] Offer {offer_id} successfully corrected and validated"
+                    )
+                    return True, offer_id, None
+                else:
+                    logger.error(
+                        f"[Pre-Publish Auto-Correct] Offer {offer_id} still invalid after correction: {validation_error2}"
+                    )
+                    return False, None, f"Pre-publish validation failed after auto-correct: {validation_error2}"
+            else:
+                # Prices are equal at cents precision but validation still failed
+                # This shouldn't happen with equal_money, but log for debugging
+                logger.warning(
+                    f"[Pre-Publish] Offer {offer_id} price comparison passed but validation failed: {validation_error}"
+                )
         except Exception as e:
-            return False, None, f"Failed to rebuild offer payload: {str(e)}"
-    
-    logger.info(f"[Pre-Publish] Creating new offer to replace corrupted offer {offer_id}")
-    create_success, create_response, new_offer_id, create_error = client.create_offer(offer=offer_payload)
-    
-    if not create_success:
-        return False, None, f"Failed to recreate offer after delete: {create_error}"
-    
-    logger.info(f"[Pre-Publish] Created new offer {new_offer_id} to replace corrupted offer {offer_id}")
-    
-    # Step 6: Re-validate new offer
-    get_success2, offer_data2, get_error2 = client.get_offer(new_offer_id)
-    if not get_success2:
-        return False, None, f"Failed to retrieve recreated offer {new_offer_id}: {get_error2}"
-    
-    is_valid2, validation_error2 = prepublish_assertions(
-        offer_json=offer_data2,
-        expected_marketplace_id=expected_marketplace_id,
-        expected_currency=expected_currency,
-        expected_price=expected_price
+            logger.error(f"[Pre-Publish Auto-Correct] Exception during auto-correct: {e}", exc_info=True)
+            # Fall through to manual intervention required
+
+    # No auto-correct for non-price errors or if auto-correct failed
+    logger.warning(
+        f"[Pre-Publish] Offer {offer_id} validation failed: {validation_error} "
+        f"(currency={currency}, price={price_value}). "
+        f"Manual intervention required."
     )
-    
-    if not is_valid2:
-        return False, None, f"Recreated offer {new_offer_id} still fails validation: {validation_error2}"
-    
-    logger.info(f"[Pre-Publish] Recreated offer {new_offer_id} passed all pre-publish assertions")
-    return True, new_offer_id, None
+
+    # Return validation failure
+    return False, None, f"Pre-publish validation failed: {validation_error}"
 
 
 async def publish_offer(
@@ -987,16 +1517,16 @@ async def publish_offer(
     try:
         from integrations.ebay.mapping import build_offer
         from services.policy_settings import get_policy_settings
-        
+
         policy_service = get_policy_settings(session)
-        resolved_ids = policy_service.get_resolved_ids(marketplace_id)
-        
+        defaults = policy_service.ensure_defaults(marketplace_id)
+
         if book:
             offer_payload = build_offer(
                 book=book,
-                payment_policy_id=resolved_ids.get("payment_policy_id"),
-                return_policy_id=resolved_ids.get("return_policy_id"),
-                fulfillment_policy_id=resolved_ids.get("fulfillment_policy_id")
+                payment_policy_id=defaults.payment_policy_id,
+                return_policy_id=defaults.return_policy_id,
+                fulfillment_policy_id=defaults.fulfillment_policy_id
             )
     except Exception as e:
         logger.warning(f"[Publish] Could not build offer payload for recreate fallback: {e}")
@@ -1111,6 +1641,58 @@ async def publish_book(
             logger.info(f"Auto-selected category ID: {category_id}")
     else:
         logger.info(f"Using provided category ID: {category_id}")
+
+    # Ensure policy defaults are set (auto-select if not set)
+    from services.policy_settings import get_policy_settings
+    from settings import ebay_settings
+
+    marketplace_id = ebay_settings.ebay_marketplace_id
+
+    # If policy IDs not provided, use defaults (ensure defaults exist)
+    if not payment_policy_id or not return_policy_id or not fulfillment_policy_id:
+        try:
+            policy_service = get_policy_settings(session)
+            defaults = policy_service.ensure_defaults(marketplace_id)
+
+            # Use defaults for any missing policy IDs
+            if not payment_policy_id:
+                payment_policy_id = defaults.payment_policy_id
+            if not return_policy_id:
+                return_policy_id = defaults.return_policy_id
+            if not fulfillment_policy_id:
+                fulfillment_policy_id = defaults.fulfillment_policy_id
+
+            # Validate all policies are present
+            if not payment_policy_id or not return_policy_id or not fulfillment_policy_id:
+                return {
+                    "success": False,
+                    "sku": None,
+                    "offer_id": None,
+                    "listing_id": None,
+                    "listing_url": None,
+                    "steps": {},
+                    "error": "Missing policy defaults",
+                    "marketplace_id": marketplace_id,
+                    "action": "Call /ebay/policies/auto-select or set manually"
+                }
+
+            logger.info(
+                f"[Publish] Using policies: payment={payment_policy_id}, "
+                f"return={return_policy_id}, fulfillment={fulfillment_policy_id}"
+            )
+
+        except Exception as e:
+            logger.error(f"[Publish] Failed to ensure policy defaults: {e}")
+            return {
+                "success": False,
+                "sku": None,
+                "offer_id": None,
+                "listing_id": None,
+                "listing_url": None,
+                "steps": {},
+                "error": f"Failed to resolve policy defaults: {str(e)}",
+                "action": "Call /ebay/policies/auto-select or check eBay account connection"
+            }
 
     # Step 1: Create or replace inventory item
     inv_result = await create_or_replace_inventory_item(

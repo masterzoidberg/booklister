@@ -9,6 +9,9 @@ import logging
 import requests
 import time
 import uuid
+import os
+from pathlib import Path
+from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
 from sqlmodel import Session
 
@@ -18,6 +21,176 @@ from .config import get_oauth_config
 from settings import ebay_settings
 
 logger = logging.getLogger(__name__)
+
+# Directory for storing offer payload traces
+OFFER_TRACE_DIR = Path("backend/logs/offer_payloads")
+
+# Directory for storing full eBay API traces (when EBAY_TRACE=1)
+EBAY_TRACE_DIR = Path("backend/logs/ebay")
+
+
+def _redact_auth(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Redact Authorization headers from data dict.
+
+    Args:
+        data: Dict potentially containing authorization info
+
+    Returns:
+        Dict with authorization redacted
+    """
+    if not data:
+        return data
+
+    result = data.copy()
+    if "headers" in result:
+        headers = result["headers"].copy() if isinstance(result["headers"], dict) else {}
+        if "Authorization" in headers:
+            headers["Authorization"] = "Bearer ***REDACTED***"
+        result["headers"] = headers
+
+    return result
+
+
+def _save_ebay_trace(
+    trace_type: str,
+    request_payload: Optional[Dict[str, Any]],
+    response_payload: Optional[Dict[str, Any]],
+    status_code: Optional[int],
+    method: str,
+    endpoint: str,
+    request_id: str,
+    headers: Dict[str, str]
+) -> Optional[str]:
+    """
+    Save full eBay API request/response trace when EBAY_TRACE=1.
+
+    Args:
+        trace_type: Type of trace ("inventory_put", "offer_create", "offer_get", etc.)
+        request_payload: Request body (if any)
+        response_payload: Response body (if any)
+        status_code: HTTP status code
+        method: HTTP method
+        endpoint: API endpoint
+        request_id: Request ID
+        headers: Request headers
+
+    Returns:
+        Path to saved file or None if EBAY_TRACE not set or save failed
+    """
+    try:
+        # Only trace when EBAY_TRACE=1
+        if os.environ.get("EBAY_TRACE") != "1":
+            return None
+
+        # Create trace directory
+        EBAY_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Build filename
+        filename = f"{trace_type}.json"
+        filepath = EBAY_TRACE_DIR / filename
+
+        # Redact authorization
+        safe_headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+        safe_headers["Authorization"] = "Bearer ***REDACTED***"
+
+        # Build trace document
+        trace_doc = {
+            "timestamp": datetime.now().isoformat(),
+            "request_id": request_id,
+            "method": method.upper(),
+            "endpoint": endpoint,
+            "status_code": status_code,
+            "headers": safe_headers,
+            "request": request_payload,
+            "response": response_payload
+        }
+
+        # Write to disk (untruncated)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(trace_doc, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"[eBay Trace] Saved {trace_type} to {filepath}")
+        return str(filepath)
+
+    except Exception as e:
+        logger.error(f"[eBay Trace] Failed to save {trace_type} trace: {e}", exc_info=True)
+        return None
+
+
+def _save_offer_trace(
+    payload: Dict[str, Any],
+    method: str,
+    endpoint: str,
+    request_id: str,
+    headers: Dict[str, str]
+) -> Optional[str]:
+    """
+    Save full offer payload to disk for debugging.
+
+    Args:
+        payload: Request payload
+        method: HTTP method
+        endpoint: API endpoint
+        request_id: Request ID for correlation
+        headers: Request headers (Authorization will be redacted)
+
+    Returns:
+        Path to saved file or None if save failed
+    """
+    try:
+        # Only trace offer-related endpoints
+        if "/offer" not in endpoint.lower():
+            return None
+
+        # Extract SKU from payload
+        sku = payload.get("sku", "unknown")
+
+        # Generate timestamp
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+        # Determine action from endpoint and method
+        if "publish" in endpoint.lower():
+            action = "publish"
+        elif method.upper() == "POST":
+            action = "create"
+        elif method.upper() == "PUT":
+            action = "update"
+        else:
+            action = method.lower()
+
+        # Create trace directory if needed
+        OFFER_TRACE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Build filename
+        filename = f"{timestamp}-{sku}-{action}.json"
+        filepath = OFFER_TRACE_DIR / filename
+
+        # Redact authorization header
+        safe_headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
+        safe_headers["Authorization"] = "Bearer ***REDACTED***"
+
+        # Build trace document
+        trace_doc = {
+            "timestamp": datetime.now().isoformat(),
+            "request_id": request_id,
+            "method": method.upper(),
+            "endpoint": endpoint,
+            "sku": sku,
+            "headers": safe_headers,
+            "payload": payload
+        }
+
+        # Write to disk (untruncated)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(trace_doc, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"[Offer Trace] Saved payload to {filepath}")
+        return str(filepath)
+
+    except Exception as e:
+        logger.error(f"[Offer Trace] Failed to save trace: {e}", exc_info=True)
+        return None
 
 
 class EBayClient:
@@ -121,6 +294,12 @@ class EBayClient:
             try:
                 logger.info(f"[Request {request_id}] {method} {url} (body: {'yes' if data else 'no'})")
                 if data:
+                    # Save offer payload trace to disk (untruncated)
+                    if "/offer" in endpoint.lower():
+                        trace_path = _save_offer_trace(data, method, endpoint, request_id, headers)
+                        if trace_path:
+                            logger.info(f"[Request {request_id}] Offer payload traced to: {trace_path}")
+
                     # Log full request body for debugging serialization issues
                     try:
                         request_body_json = json.dumps(data, indent=2)
@@ -129,7 +308,7 @@ class EBayClient:
                             logger.info(f"[Request {request_id}] ... (truncated, total length: {len(request_body_json)} chars)")
                     except Exception as e:
                         logger.error(f"[Request {request_id}] Failed to serialize request body to JSON: {e}")
-                    
+
                     # Log aspects for debugging if present
                     if isinstance(data, dict) and "product" in data and "aspects" in data.get("product", {}):
                         aspects = data["product"]["aspects"]
@@ -143,7 +322,7 @@ class EBayClient:
                             logger.info(f"[Request {request_id}] Aspects JSON:\n{aspects_json}")
                         except Exception as e:
                             logger.error(f"[Request {request_id}] Failed to serialize aspects to JSON: {e}")
-                
+
                 # Make request
                 response = requests.request(
                     method=method,
@@ -175,6 +354,29 @@ class EBayClient:
                     try:
                         response_json = response.json() if response.content else {}
                         logger.debug(f"[Request {request_id}] Response: {response_json}")
+
+                        # Save EBAY_TRACE if enabled
+                        if os.environ.get("EBAY_TRACE") == "1":
+                            trace_type = None
+                            if "/inventory_item/" in endpoint:
+                                trace_type = "inventory_put"
+                            elif endpoint == "/sell/inventory/v1/offer" and method.upper() == "POST":
+                                trace_type = "offer_create"
+                            elif "/offer/" in endpoint and "/publish" not in endpoint and method.upper() == "GET":
+                                trace_type = "offer_get"
+
+                            if trace_type:
+                                _save_ebay_trace(
+                                    trace_type=trace_type,
+                                    request_payload=data,
+                                    response_payload=response_json,
+                                    status_code=response.status_code,
+                                    method=method,
+                                    endpoint=endpoint,
+                                    request_id=request_id,
+                                    headers=headers
+                                )
+
                         return response_json, response.status_code, None
                     except ValueError:
                         # Non-JSON response (shouldn't happen with eBay API)
@@ -401,6 +603,9 @@ class EBayClient:
         """
         Update existing offer.
 
+        IMPORTANT: Normalizes policy placement to listingPolicies before sending.
+        Policies must ALWAYS live under listingPolicies, NEVER at root.
+
         Args:
             offer_id: Offer ID to update
             offer: Offer payload
@@ -408,12 +613,45 @@ class EBayClient:
         Returns:
             Tuple of (success, response_data, error_message)
         """
+        # Normalize policy placement: move root policy keys to listingPolicies
+        # This ensures compatibility with both old and new code paths
+        normalized_offer = offer.copy()
+
+        # Ensure listingPolicies exists
+        normalized_offer.setdefault("listingPolicies", {})
+        lp = normalized_offer["listingPolicies"]
+
+        # Move any root-level policy IDs into listingPolicies (no clobbering)
+        if "paymentPolicyId" in normalized_offer and "paymentPolicyId" not in lp:
+            lp["paymentPolicyId"] = normalized_offer.pop("paymentPolicyId")
+        elif "paymentPolicyId" in normalized_offer:
+            # Remove stray root key if already in listingPolicies
+            normalized_offer.pop("paymentPolicyId", None)
+
+        if "fulfillmentPolicyId" in normalized_offer and "fulfillmentPolicyId" not in lp:
+            lp["fulfillmentPolicyId"] = normalized_offer.pop("fulfillmentPolicyId")
+        elif "fulfillmentPolicyId" in normalized_offer:
+            normalized_offer.pop("fulfillmentPolicyId", None)
+
+        if "returnPolicyId" in normalized_offer and "returnPolicyId" not in lp:
+            lp["returnPolicyId"] = normalized_offer.pop("returnPolicyId")
+        elif "returnPolicyId" in normalized_offer:
+            normalized_offer.pop("returnPolicyId", None)
+
+        # Log policy placement for debugging
+        logger.info(
+            f"[Offer Update] Normalized policies for offer {offer_id}: "
+            f"payment={lp.get('paymentPolicyId')} "
+            f"fulfillment={lp.get('fulfillmentPolicyId')} "
+            f"return={lp.get('returnPolicyId')}"
+        )
+
         endpoint = f"/sell/inventory/v1/offer/{offer_id}"
         logger.info(f"[Offer] Updating offer {offer_id}")
         response_json, status_code, error = self._make_request(
             method="PUT",
             endpoint=endpoint,
-            data=offer
+            data=normalized_offer
         )
 
         if status_code in [200, 204]:
@@ -559,20 +797,25 @@ class EBayClient:
             f"[Self-Heal] Offer {offer_id} needs update: {', '.join(update_reason)}"
         )
 
-        # Ensure pricing structure exists in offer_data (use request-like format)
-        if "pricing" not in offer_data:
-            offer_data["pricing"] = {}
-        if "price" not in offer_data["pricing"]:
-            offer_data["pricing"]["price"] = {}
+        # Ensure pricingSummary structure exists in offer_data (use pricingSummary, never pricing)
+        if "pricingSummary" not in offer_data:
+            offer_data["pricingSummary"] = {}
+        if "price" not in offer_data["pricingSummary"]:
+            offer_data["pricingSummary"]["price"] = {}
         
-        # Update the pricing in the offer data
-        offer_data["pricing"]["price"]["currency"] = expected_currency
+        # Update the pricingSummary in the offer data
+        offer_data["pricingSummary"]["price"]["currency"] = expected_currency
         if expected_price:
-            offer_data["pricing"]["price"]["value"] = expected_price
+            offer_data["pricingSummary"]["price"]["value"] = expected_price
         elif normalized_current_price:
-            offer_data["pricing"]["price"]["value"] = normalized_current_price
+            offer_data["pricingSummary"]["price"]["value"] = normalized_current_price
         else:
-            offer_data["pricing"]["price"]["value"] = current_price
+            offer_data["pricingSummary"]["price"]["value"] = current_price
+
+        # Remove pricing field if it exists (should only use pricingSummary)
+        if "pricing" in offer_data:
+            logger.warning(f"[Self-Heal] Removing deprecated 'pricing' field from offer {offer_id}")
+            del offer_data["pricing"]
 
         # PUT the updated offer
         update_success, update_data, update_error = self.update_offer(offer_id, offer_data)
